@@ -126,19 +126,36 @@ if __name__ == "__main__":
     torchbench_main()
 
 
-BACKENDS=("eager" "aot_eager" "inductor" "zentorch" "ipex")
-  TEST_REPORTS_DIR=$(pwd)/test/test-reports
+#!/bin/bash
 
-  # Ensure the test reports directory exists
-  mkdir -p "$TEST_REPORTS_DIR"
+set -ex
 
-  # Iterate over each backend and run TorchBench
-  for backend in "${BACKENDS[@]}"; do
-    echo "Running TorchBench with backend: $backend"
-    python benchmarks/dynamo/torchbench.py \
-      --device "cpu" \
-      --backend "$backend" \
-      --inference \
-      --performance \
-      --output "$TEST_REPORTS_DIR/${backend}_torchbench.csv"
-  done
+# Variables
+TEST_REPORTS_DIR=$(pwd)/test/test-reports
+BACKENDS=("eager" "aot_eager" "inductor" "zentorch" "ipex")  # Include new backends
+DEVICE="cpu"
+
+# Ensure the test reports directory exists
+mkdir -p "$TEST_REPORTS_DIR"
+
+run_torchbench() {
+  local backend=$1
+  local output_file="$TEST_REPORTS_DIR/${backend}_torchbench.csv"
+
+  echo "Running TorchBench with backend: $backend"
+
+  python torchbench.py \
+    --device "$DEVICE" \
+    --backend "$backend" \
+    --inference \
+    --performance \
+    --output "$output_file"
+}
+
+# Run TorchBench for all backends
+for backend in "${BACKENDS[@]}"; do
+  run_torchbench "$backend"
+done
+
+# Summary of Results
+echo "TorchBench test results available in: $TEST_REPORTS_DIR"
