@@ -124,3 +124,21 @@ def torchbench_main():
 
 if __name__ == "__main__":
     torchbench_main()
+
+
+BACKENDS=("eager" "aot_eager" "inductor" "zentorch" "ipex")
+  TEST_REPORTS_DIR=$(pwd)/test/test-reports
+
+  # Ensure the test reports directory exists
+  mkdir -p "$TEST_REPORTS_DIR"
+
+  # Iterate over each backend and run TorchBench
+  for backend in "${BACKENDS[@]}"; do
+    echo "Running TorchBench with backend: $backend"
+    python benchmarks/dynamo/torchbench.py \
+      --device "cpu" \
+      --backend "$backend" \
+      --inference \
+      --performance \
+      --output "$TEST_REPORTS_DIR/${backend}_torchbench.csv"
+  done
