@@ -160,7 +160,7 @@ done
 # Summary of Results
 echo "TorchBench test results available in: $TEST_REPORTS_DIR"
 
-
+version --1
 Abstract
 This paper presents an optimized approach for deploying the Deep Learning Recommendation Model (DLRM) in both Python and C++ environments. Leveraging the oneDNN PyTorch Plugin and Ahead-Of-Time (AOT) compilation through the Inductor path, we provide a seamless workflow to enhance model performance. Our solution focuses on generating efficient .so files for C++ while retaining compatibility with Python exports, ensuring interoperability and scalability. Benchmark results demonstrate that the C++ environment outperforms the PyTorch environment, showcasing the effectiveness of the proposed solution.
 
@@ -213,3 +213,11 @@ The benchmark results demonstrate that the C++ environment, enhanced by oneDNN o
 
 Reduced Latency: The C++ deployment achieves lower inference latency compared to the Python environment.
 Higher Throughput: The optimized C++ pipeline processes a greater volume of requests per second, proving its scalability for large-scale recommendation systems.
+                                                                                                                        
+                                                                                                                
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+version -2
+Optimizing the deployment of the Deep Learning Recommendation Model (DLRM) across Python and C++ environments is critical for enhancing performance and scalability. By utilizing the oneDNN PyTorch Plugin and Ahead-Of-Time (AOT) compilation with Inductor, a streamlined workflow is developed to generate .so files for efficient C++ deployment while preserving Python compatibility. The optimized C++ environment achieves notable improvements in latency and throughput, making it suitable for large-scale recommendation systems.
+
