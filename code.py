@@ -159,3 +159,57 @@ done
 
 # Summary of Results
 echo "TorchBench test results available in: $TEST_REPORTS_DIR"
+
+
+Abstract
+This paper presents an optimized approach for deploying the Deep Learning Recommendation Model (DLRM) in both Python and C++ environments. Leveraging the oneDNN PyTorch Plugin and Ahead-Of-Time (AOT) compilation through the Inductor path, we provide a seamless workflow to enhance model performance. Our solution focuses on generating efficient .so files for C++ while retaining compatibility with Python exports, ensuring interoperability and scalability. Benchmark results demonstrate that the C++ environment outperforms the PyTorch environment, showcasing the effectiveness of the proposed solution.
+
+Introduction
+Recommendation systems like the Deep Learning Recommendation Model (DLRM) are pivotal in applications that require personalized experiences, such as e-commerce and social media platforms. While PyTorch provides an excellent framework for model development, deploying models in high-performance C++ environments remains challenging. Transitioning from Python to C++ often involves trade-offs in compatibility and performance.
+
+This paper addresses these challenges by introducing a pipeline that integrates the oneDNN PyTorch Plugin with AOT Inductor to optimize DLRM for deployment in C++ environments. By aligning the deployment pipeline with hardware optimizations from oneDNN, this solution ensures reduced latency and higher throughput, meeting the performance demands of modern recommendation systems.
+
+Problem Statement
+Deploying machine learning models like DLRM in Python and C++ environments poses the following challenges:
+
+Performance Disparity: Models optimized for Python often underperform when transitioned to C++ without additional tuning.
+Complex Workflows: Transitioning models between Python development environments and C++ production requires extensive engineering, leading to increased development time.
+Hardware Underutilization: Existing workflows fail to fully leverage hardware-specific optimizations such as those provided by oneDNN, resulting in inefficient inference performance.
+Interoperability Gaps: Maintaining compatibility between Python and C++ exports for iterative development and deployment remains a bottleneck.
+Relevance to Intel
+Intel, as a leader in advancing high-performance computing and AI solutions, seeks to demonstrate the capabilities of oneDNN in optimizing machine learning workloads. By focusing on integrating the oneDNN PyTorch Plugin and leveraging Intel hardware capabilities, this work addresses Intel’s goals of enabling scalable, efficient model deployments. The proposed solution highlights the tangible benefits of Intel's oneDNN library, showcasing its role in enhancing the performance of recommendation systems like DLRM.
+
+Proposed Solution
+The solution builds a robust pipeline to optimize DLRM deployment across Python and C++ environments. The workflow includes the following steps:
+
+Workflow Explanation:
+Model Preparation:
+
+The DLRM model is developed and trained in PyTorch, leveraging its user-friendly APIs for iterative experimentation.
+Export:
+
+The trained model is exported into an intermediate representation, enabling compatibility with further optimization processes.
+Integration of oneDNN PyTorch Plugin:
+
+The exported model passes through the oneDNN PyTorch Plugin, which:
+Applies hardware-specific optimizations to maximize performance.
+Prepares the model for subsequent compilation with AOT Inductor.
+AOT Inductor Compilation:
+
+The AOT Inductor path compiles the optimized model into:
+.so files for high-performance C++ deployment.
+Python-compatible artifacts for iterative research and debugging.
+Deployment:
+
+The generated .so files are deployed in a C++ environment, leveraging oneDNN optimizations to ensure superior runtime performance.
+Workflow Diagram:
+rust
+Copy code
+Model --> Export --> oneDNN PyTorch Plugin --> AOT Inductor --> Python Export
+                                                    |
+                                                    --> .so files for C++ Export
+Results
+The benchmark results demonstrate that the C++ environment, enhanced by oneDNN optimizations and AOT Inductor compilation, outperforms the PyTorch environment in terms of runtime efficiency and throughput. Key metrics include:
+
+Reduced Latency: The C++ deployment achieves lower inference latency compared to the Python environment.
+Higher Throughput: The optimized C++ pipeline processes a greater volume of requests per second, proving its scalability for large-scale recommendation systems.
