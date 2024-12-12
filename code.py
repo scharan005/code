@@ -223,3 +223,21 @@ Optimizing the deployment of the Deep Learning Recommendation Model (DLRM) acros
 
 Transitioning DLRM between Python and C++ environments poses several challenges. Performance often suffers due to inefficient hardware utilization in C++, while managing separate workflows increases engineering complexity. Existing methods fail to fully leverage Intel’s oneDNN, limiting optimization opportunities. Additionally, maintaining compatibility between Python-trained models and C++ deployments remains a significant bottleneck, hindering seamless integration and scalability.
 Intel’s oneDNN library is designed to deliver high-performance AI solutions across heterogeneous environments. This project demonstrates the potential of the oneDNN PyTorch Plugin in optimizing DLRM deployments, aligning with Intel’s goal of enhancing AI workload efficiency and scalability. By showcasing performance improvements in the C++ environment, the work highlights Intel's technology as a critical enabler for efficient machine learning systems.
+To optimize DLRM deployment across Python and C++ environments, a streamlined workflow is developed by integrating the oneDNN PyTorch Plugin with Ahead-Of-Time (AOT) Inductor compilation. This approach enhances performance in C++ while maintaining Python compatibility. The workflow consists of the following steps:
+
+Model Preparation:
+
+The DLRM model is trained and fine-tuned in PyTorch, leveraging its flexibility for development and experimentation.
+Export and Optimization:
+
+The oneDNN PyTorch Plugin exports the model into an intermediate representation, applying hardware-specific optimizations to generate an initial .so file.
+AOT Compilation:
+
+The AOT Inductor compiles the model further, producing a final .so file optimized for high-performance execution in C++.
+C++ Deployment:
+
+The optimized .so file is deployed in a C++ environment, where benchmarks validate significant performance improvements in latency and throughput.
+Python Compatibility:
+
+Python-compatible exports are retained to enable debugging and further development, ensuring flexibility for iterative improvements.
+This workflow bridges Python development and C++ deployment, providing a high-performance, scalable solution tailored for recommendation systems.
