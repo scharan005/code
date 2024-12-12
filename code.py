@@ -264,3 +264,29 @@ C++ Deployment:
 
 The plugin.so and model.so files are combined in the C++ environment for deployment.
 Benchmarks are conducted to validate the performance improvements, including reduced latency and increased throughput.
+                                                                                                            
+                                                                                                            
+                                                                                                            
+ from diagrams import Diagram
+from diagrams.programming.language import Python, Cpp
+from diagrams.generic.storage import Storage
+from diagrams.programming.flowchart import Process, Decision
+
+with Diagram("DLRM Deployment Workflow", show=False):
+    # Components
+    config_model = Process("Configure DLRM Model\n(Top and Bottom MLP Layers)")
+    export_plugin = Process("Export Model and Generate\nPlugin.so via oneDNN PyTorch Plugin")
+    aot_compilation = Process("AOT Compilation\nGenerate Model.so")
+    python_export = Python("Python Export\n(Debugging, Dev)")
+    model_so = Storage("Model.so\n(for C++ Execution)")
+    plugin_so = Storage("Plugin.so\n(from oneDNN Plugin)")
+    cpp_env = Cpp("Combine Plugin.so and Model.so\nRun Benchmarks in C++ Env")
+    results = Decision("Benchmarks:\nImproved Latency & Throughput")
+
+    # Workflow connections with horizontal spread
+    config_model >> export_plugin
+    export_plugin >> [plugin_so, aot_compilation]  # Spread horizontally
+    aot_compilation >> [python_export, model_so]  # Spread horizontally
+    [plugin_so, model_so] >> cpp_env
+    cpp_env >> results
+
