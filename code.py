@@ -241,3 +241,22 @@ Python Compatibility:
 
 Python-compatible exports are retained to enable debugging and further development, ensuring flexibility for iterative improvements.
 This workflow bridges Python development and C++ deployment, providing a high-performance, scalable solution tailored for recommendation systems.
+                                                                                                            
+                                                                                                            
+Model Configuration:
+
+The DLRM model is configured with top and bottom MLP layers according to Meta’s specifications.
+Export & Optimize:
+
+The oneDNN PyTorch Plugin exports the configured model into an intermediate representation and applies optimizations.
+AOT Compilation:
+
+The model is compiled using AOT Inductor, generating a .so file optimized for C++ deployment.
+Dual Outputs:
+
+Python Export: Retained for debugging and iterative development.
+Model .so File: Prepared for deployment in the C++ environment.
+C++ Deployment:
+
+Combine the plugin .so file with the model .so file in the C++ environment.
+Run benchmarks to validate performance improvements, including reduced latency and increased throughput.
