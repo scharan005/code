@@ -1,162 +1,204 @@
-python -c "
-import json
-old = json.load(open('$combined_json'))
-for line in '''$result'''.split('\n'):
-    line = line.strip()
-    if line.startswith('{') and line.endswith('}'):
-        old.append(json.loads(line))
-json.dump(old, open('$combined_json','w'), indent=2)
-"
+#!/usr/bin/env python3
 
-"""
-test_bench.py
-Runs hub models in benchmark mode using pytest-benchmark on CPU.
-
-Usage:
-  python install.py
-  pytest test_bench.py --backend=zentorch
-
-See pytest-benchmark help (pytest test_bench.py -h) for additional options
-e.g. --benchmark-autosave
-     --benchmark-compare
-     -k <filter expression>
-     --ignore_machine_config
-"""
-
+import importlib
+import logging
 import os
-import time
-import pytest
-import torch
-from torchbenchmark import _list_model_paths, get_metadata_from_yaml, ModelTask
-from torchbenchmark._components._impl.workers import subprocess_worker
-from torchbenchmark.util.machine_config import get_machine_state
-from torchbenchmark.util.metadata_utils import skip_by_metadata
+import re
+import subprocess
+import sys
+import warnings
 
-
-# 🛠️ Register Custom Zentorch Backend
-def custom_zentorch_backend(model, inputs):
-    print("Using custom Zentorch backend for compilation.")
-    return model  # Placeholder for actual Zentorch integration
-
-torch._dynamo.register_backend("zentorch", custom_zentorch_backend)
-
-
-# 🛠️ Add `--backend` Flag for Custom Backend Support
-def pytest_addoption(parser):
-    parser.addoption(
-        "--backend", action="store", default=None, help="Specify custom backend for torch.compile"
+try:
+    from .common import (
+        BenchmarkRunner,
+        download_retry_decorator,
+        load_yaml_file,
+        main,
+        reset_rng_state,
+    )
+except ImportError:
+    from common import (
+        BenchmarkRunner,
+        download_retry_decorator,
+        load_yaml_file,
+        main,
+        reset_rng_state,
     )
 
-
-# 🛠️ Generate Model Tests (ONLY CPU MODE)
-def pytest_generate_tests(metafunc):
-    devices = ["cpu"]  # Run only on CPU
-
-    if metafunc.cls and metafunc.cls.__name__ == "TestBenchNetwork":
-        paths = _list_model_paths()
-        metafunc.parametrize(
-            "model_path",
-            paths,
-            ids=[os.path.basename(path) for path in paths],
-            scope="class",
-        )
-
-        metafunc.parametrize("device", devices, scope="class")
+import torch
+from torch._dynamo.testing import collect_results
+from torch._dynamo.utils import clone_inputs
 
 
-@pytest.mark.benchmark(
-    warmup=True,
-    warmup_iterations=3,
-    disable_gc=False,
-    timer=time.perf_counter,
-    group="hub",
-)
-class TestBenchNetwork:
-    """Run Benchmarks for Each Model on CPU"""
+log = logging.getLogger(__name__)
 
-    def test_train(self, model_path, device, benchmark, pytestconfig):
-        """Runs training benchmark on CPU"""
-        try:
-            model_name = os.path.basename(model_path)
-            if skip_by_metadata(test="train", device=device, extra_args=[], metadata=get_metadata_from_yaml(model_path)):
-                raise NotImplementedError("Test skipped by its metadata.")
+# ✅ **DISABLE INDUCTOR COMPLETELY** (Ensures we don't default to Inductor)
+os.environ["TORCHINDUCTOR_DISABLE"] = "1"
 
-            if "quantized" in model_name:
-                return
+# ✅ **Force the user-defined backend** instead of letting it default to Inductor.
+if "TORCH_COMPILE_BACKEND" in os.environ:
+    chosen_backend = os.environ["TORCH_COMPILE_BACKEND"]
+    log.info(f"Using explicitly set backend: {chosen_backend}")
+else:
+    chosen_backend = "eager"  # Default to eager mode if no backend is set.
+    log.info("No backend specified. Using eager mode.")
 
-            task = ModelTask(model_name)
-            if not task.model_details.exists:
-                return  # Model is not supported.
+# ✅ **Check available backends to verify user-defined backend exists**
+available_backends = torch._dynamo.list_backends()
+if chosen_backend not in available_backends:
+    raise ValueError(
+        f"Backend '{chosen_backend}' is not available. Available backends: {available_backends}"
+    )
 
-            task.make_model_instance(test="train", device=device)
+# ✅ **Manually override the backend setting**
+torch._dynamo.reset()  # Reset any previously set backend
+os.environ["TORCH_COMPILE_BACKEND"] = chosen_backend
 
-            # Apply custom backend if specified
-            backend = pytestconfig.getoption("backend")
-            if backend:
-                print(f"⚙️ Using {backend} backend for training {model_name} on CPU")
-                task.model = torch.compile(task.model, backend=backend)
+# ✅ **Disable FX Graph Caching for testing (Remove Inductor dependence)**
+if "TORCHINDUCTOR_FX_GRAPH_CACHE" in os.environ:
+    del os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"]
 
-            benchmark(task.invoke)
-            benchmark.extra_info["machine_state"] = get_machine_state()
-            benchmark.extra_info["batch_size"] = task.get_model_attribute("batch_size")
-            benchmark.extra_info["precision"] = task.get_model_attribute("dargs", "precision")
-            benchmark.extra_info["test"] = "train"
-
-        except NotImplementedError:
-            print(f"⚠️ Test train on {device} is not implemented, skipping...")
-
-    def test_eval(self, model_path, device, benchmark, pytestconfig):
-        """Runs evaluation benchmark on CPU"""
-        try:
-            model_name = os.path.basename(model_path)
-            if skip_by_metadata(test="eval", device=device, extra_args=[], metadata=get_metadata_from_yaml(model_path)):
-                raise NotImplementedError("Test skipped by its metadata.")
-
-            if "quantized" in model_name:
-                return
-
-            task = ModelTask(model_name)
-            if not task.model_details.exists:
-                return  # Model is not supported.
-
-            task.make_model_instance(test="eval", device=device)
-
-            # Apply custom backend if specified
-            backend = pytestconfig.getoption("backend")
-            if backend:
-                print(f"⚙️ Using {backend} backend for evaluation {model_name} on CPU")
-                task.model = torch.compile(task.model, backend=backend)
-
-            benchmark(task.invoke)
-            benchmark.extra_info["machine_state"] = get_machine_state()
-            benchmark.extra_info["batch_size"] = task.get_model_attribute("batch_size")
-            benchmark.extra_info["precision"] = task.get_model_attribute("dargs", "precision")
-            benchmark.extra_info["test"] = "eval"
-
-        except NotImplementedError:
-            print(f"⚠️ Test eval on {device} is not implemented, skipping...")
+# ✅ **Ensure Autograd cache is disabled for our custom backend**
+torch._functorch.config.enable_autograd_cache = False
 
 
-@pytest.mark.benchmark(
-    warmup=True,
-    warmup_iterations=3,
-    disable_gc=False,
-    timer=time.perf_counter,
-    group="hub",
-)
-class TestWorker:
-    """Benchmark SubprocessWorker to make sure we aren't skewing results."""
+def pip_install(package):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
-    def test_worker_noop(self, benchmark):
-        worker = subprocess_worker.SubprocessWorker()
-        benchmark(lambda: worker.run("pass"))
 
-    def test_worker_store(self, benchmark):
-        worker = subprocess_worker.SubprocessWorker()
-        benchmark(lambda: worker.store("x", 1))
+# ✅ **Force Import Required Libraries**
+try:
+    import transformers
+except ImportError:
+    print("Installing HuggingFace Transformers...")
+    pip_install("git+https://github.com/huggingface/transformers.git#egg=transformers")
 
-    def test_worker_load(self, benchmark):
-        worker = subprocess_worker.SubprocessWorker()
-        worker.store("x", 1)
-        benchmark(lambda: worker.load("x"))
+
+class HuggingfaceRunner(BenchmarkRunner):
+    def __init__(self):
+        super().__init__()
+        self.suite_name = "huggingface"
+
+    @property
+    def _config(self):
+        return load_yaml_file("huggingface.yaml")
+
+    @property
+    def _skip(self):
+        return self._config["skip"]
+
+    @property
+    def _accuracy(self):
+        return self._config["accuracy"]
+
+    @property
+    def skip_models(self):
+        return self._skip["all"]
+
+    @property
+    def skip_models_for_cpu(self):
+        return self._skip["device"]["cpu"]
+
+    @property
+    def fp32_only_models(self):
+        return self._config["only_fp32"]
+
+    @property
+    def skip_models_due_to_control_flow(self):
+        return self._skip["control_flow"]
+
+    def _get_model_cls_and_config(self, model_name):
+        model_cls = getattr(transformers, model_name)
+        config_cls = model_cls.config_class
+        config = config_cls()
+        return model_cls, config
+
+    @download_retry_decorator
+    def _download_model(self, model_name):
+        model_cls, config = self._get_model_cls_and_config(model_name)
+        model = model_cls.from_config(config)
+        return model
+
+    def load_model(self, device, model_name, batch_size=None, extra_args=None):
+        """
+        Load the model with the user-specified backend (ipex, zentorch, etc.).
+        """
+        is_training = self.args.training
+        use_eval_mode = self.args.use_eval_mode
+        dtype = torch.float32
+        reset_rng_state()
+
+        model_cls, config = self._get_model_cls_and_config(model_name)
+        model = self._download_model(model_name)
+        model = model.to(device, dtype=dtype)
+
+        if self.args.enable_activation_checkpointing:
+            model.gradient_checkpointing_enable()
+
+        batch_size = batch_size or 16  # Default batch size if not specified
+
+        example_inputs = {
+            "input_ids": torch.randint(
+                0, config.vocab_size, (batch_size, 128), device=device
+            )
+        }
+
+        if (
+            is_training
+            and not use_eval_mode
+            and not (self.args.accuracy and model_name in self._config["only_inference"])
+        ):
+            model.train()
+        else:
+            model.eval()
+
+        # ✅ **Force Custom Backend Instead of Inductor**
+        if chosen_backend:
+            torch._dynamo.reset()
+            os.environ["TORCH_COMPILE_BACKEND"] = chosen_backend
+            model = torch.compile(model, backend=chosen_backend)
+            log.info(f"Using backend: {chosen_backend} for model: {model_name}")
+
+        self.validate_model(model, example_inputs)
+        return device, model_name, model, example_inputs, batch_size
+
+    def compute_loss(self, pred):
+        return pred[0]
+
+    def forward_pass(self, mod, inputs, collect_outputs=True):
+        with self.autocast(**self.autocast_arg):
+            return mod(**inputs)
+
+    def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
+        cloned_inputs = clone_inputs(inputs)
+        self.optimizer_zero_grad(mod)
+        with self.autocast(**self.autocast_arg):
+            pred = mod(**cloned_inputs)
+            loss = self.compute_loss(pred)
+        self.grad_scaler.scale(loss).backward()
+        self.optimizer_step()
+        if collect_outputs:
+            return collect_results(mod, pred, loss, cloned_inputs)
+        return None
+
+
+def huggingface_main():
+    """
+    Main function to run HuggingFace benchmarks with a custom backend (ipex, zentorch).
+    """
+    logging.basicConfig(level=logging.WARNING)
+    warnings.filterwarnings("ignore")
+
+    # ✅ **Check if user-specified backend is set**
+    if "TORCH_COMPILE_BACKEND" in os.environ:
+        log.info(f"Running with backend: {os.environ['TORCH_COMPILE_BACKEND']}")
+    else:
+        log.warning("Backend not set. Running in eager mode.")
+
+    main(HuggingfaceRunner())
+
+
+if __name__ == "__main__":
+    huggingface_main()
+
 
