@@ -1,91 +1,141 @@
 #!/usr/bin/env python3
 
+import gc
 import importlib
 import logging
 import os
 import re
-import subprocess
 import sys
 import warnings
-
-try:
-    from .common import (
-        BenchmarkRunner,
-        download_retry_decorator,
-        load_yaml_file,
-        main,
-        reset_rng_state,
-    )
-except ImportError:
-    from common import (
-        BenchmarkRunner,
-        download_retry_decorator,
-        load_yaml_file,
-        main,
-        reset_rng_state,
-    )
+from collections import namedtuple
+from os.path import abspath, exists
 
 import torch
-from torch._dynamo.testing import collect_results
+
+
+try:
+    from .common import BenchmarkRunner, load_yaml_file, main
+except ImportError:
+    from common import BenchmarkRunner, load_yaml_file, main
+
+from torch._dynamo.testing import collect_results, reduce_to_scalar_loss
 from torch._dynamo.utils import clone_inputs
 
 
-log = logging.getLogger(__name__)
+# We are primarily interested in tf32 datatype
+torch.backends.cuda.matmul.allow_tf32 = True
 
-# ✅ **DISABLE INDUCTOR COMPLETELY** (Ensures we don't default to Inductor)
-os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+# Enable FX graph caching
+if "TORCHINDUCTOR_FX_GRAPH_CACHE" not in os.environ:
+    torch._inductor.config.fx_graph_cache = True
 
-# ✅ **Force the user-defined backend** instead of letting it default to Inductor.
-if "TORCH_COMPILE_BACKEND" in os.environ:
-    chosen_backend = os.environ["TORCH_COMPILE_BACKEND"]
-    log.info(f"Using explicitly set backend: {chosen_backend}")
-else:
-    chosen_backend = "eager"  # Default to eager mode if no backend is set.
-    log.info("No backend specified. Using eager mode.")
+# Enable Autograd caching
+if "TORCHINDUCTOR_AUTOGRAD_CACHE" not in os.environ:
+    torch._functorch.config.enable_autograd_cache = True
 
-# ✅ **Check available backends to verify user-defined backend exists**
-available_backends = torch._dynamo.list_backends()
-if chosen_backend not in available_backends:
-    raise ValueError(
-        f"Backend '{chosen_backend}' is not available. Available backends: {available_backends}"
-    )
+BATCH_SIZE_KNOWN_MODELS = {}
 
-# ✅ **Manually override the backend setting**
-torch._dynamo.reset()  # Reset any previously set backend
-os.environ["TORCH_COMPILE_BACKEND"] = chosen_backend
+MODELS_FILENAME = os.path.join(os.path.dirname(__file__), "torchbench_models_list.txt")
+assert os.path.exists(MODELS_FILENAME), f"Models file not found: {MODELS_FILENAME}"
 
-# ✅ **Disable FX Graph Caching for testing (Remove Inductor dependence)**
-if "TORCHINDUCTOR_FX_GRAPH_CACHE" in os.environ:
-    del os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"]
+with open(MODELS_FILENAME, "r") as fh:
+    lines = fh.readlines()
+    for line in lines:
+        model_name, batch_size = line.strip().split(",")
+        BATCH_SIZE_KNOWN_MODELS[model_name] = int(batch_size)
 
-# ✅ **Ensure Autograd cache is disabled for our custom backend**
-torch._functorch.config.enable_autograd_cache = False
+assert len(BATCH_SIZE_KNOWN_MODELS), "No models found in the models list file."
 
+def _reassign_parameters(model):
+    # torch_geometric models register parameter as tensors due to
+    # https://github.com/pyg-team/pytorch_geometric/blob/master/torch_geometric/nn/dense/linear.py#L158-L168
+    # Since it is unusual thing to do, we just reassign them to parameters
+    def state_dict_hook(module, destination, prefix, local_metadata):
+        for name, param in module.named_parameters():
+            if isinstance(destination[name], torch.Tensor) and not isinstance(
+                destination[name], torch.nn.Parameter
+            ):
+                destination[name] = torch.nn.Parameter(destination[name])
 
-def pip_install(package):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-
-# ✅ **Force Import Required Libraries**
-try:
-    import transformers
-except ImportError:
-    print("Installing HuggingFace Transformers...")
-    pip_install("git+https://github.com/huggingface/transformers.git#egg=transformers")
+    model._register_state_dict_hook(state_dict_hook)
 
 
-class HuggingfaceRunner(BenchmarkRunner):
+def setup_torchbench_cwd():
+    original_dir = abspath(os.getcwd())
+
+    os.environ["KALDI_ROOT"] = "/tmp"  # avoids some spam
+    for torchbench_dir in (
+        "./torchbenchmark",
+        "../torchbenchmark",
+        "../torchbench",
+        "../benchmark",
+        "../../torchbenchmark",
+        "../../torchbench",
+        "../../benchmark",
+        "../../../torchbenchmark",
+        "../../../torchbench",
+        "../../../benchmark",
+    ):
+        if exists(torchbench_dir):
+            break
+
+    if exists(torchbench_dir):
+        torchbench_dir = abspath(torchbench_dir)
+        os.chdir(torchbench_dir)
+        sys.path.append(torchbench_dir)
+
+    return original_dir
+
+
+def process_hf_reformer_output(out):
+    assert isinstance(out, list)
+    # second output is unstable
+    return [elem for i, elem in enumerate(out) if i != 1]
+
+
+def process_hf_whisper_output(out):
+    out_ret = []
+    for i, elem in enumerate(out):
+        if i == 0:
+            assert isinstance(elem, dict)
+            out_ret.append({k: v for k, v in elem.items() if k != "logits"})
+        elif i != 1:
+            out_ret.append(elem)
+
+    return out_ret
+
+
+process_train_model_output = {
+    "hf_Reformer": process_hf_reformer_output,
+    "hf_Whisper": process_hf_whisper_output,
+}
+
+
+class TorchBenchmarkRunner(BenchmarkRunner):
     def __init__(self):
         super().__init__()
-        self.suite_name = "huggingface"
+        self.suite_name = "torchbench"
+        self.optimizer = None
 
     @property
     def _config(self):
-        return load_yaml_file("huggingface.yaml")
+        return load_yaml_file("torchbench.yaml")
 
     @property
     def _skip(self):
         return self._config["skip"]
+
+    @property
+    def _batch_size(self):
+        return self._config["batch_size"]
+
+    @property
+    def _tolerance(self):
+        return self._config["tolerance"]
+
+    @property
+    def _require_larger_multiplier_for_smaller_tensor(self):
+        return self._config["require_larger_multiplier_for_smaller_tensor"]
 
     @property
     def _accuracy(self):
@@ -100,80 +150,316 @@ class HuggingfaceRunner(BenchmarkRunner):
         return self._skip["device"]["cpu"]
 
     @property
-    def fp32_only_models(self):
-        return self._config["only_fp32"]
+    def skip_models_for_cuda(self):
+        return self._skip["device"]["cuda"]
+
+    @property
+    def skip_models_for_freezing_cuda(self):
+        return self._skip["freezing"]["cuda"]
+
+    @property
+    def skip_models_for_freezing_cpu(self):
+        return self._skip["freezing"]["cpu"]
+
+    @property
+    def slow_models(self):
+        return self._config["slow"]
+
+    @property
+    def very_slow_models(self):
+        return self._config["very_slow"]
+
+    @property
+    def non_deterministic_models(self):
+        return self._config["non_deterministic"]
+
+    @property
+    def get_output_amp_train_process_func(self):
+        return process_train_model_output
+
+    @property
+    def skip_not_suitable_for_training_models(self):
+        return self._skip["test"]["training"]
+
+    @property
+    def failing_fx2trt_models(self):
+        return self._config["trt_not_yet_working"]
+
+    @property
+    def force_amp_for_fp16_bf16_models(self):
+        return self._config["dtype"]["force_amp_for_fp16_bf16_models"]
+
+    @property
+    def force_fp16_for_bf16_models(self):
+        return self._config["dtype"]["force_fp16_for_bf16_models"]
+
+    @property
+    def skip_accuracy_checks_large_models_dashboard(self):
+        if self.args.dashboard or self.args.accuracy:
+            return self._accuracy["skip"]["large_models"]
+        return set()
+
+    @property
+    def skip_accuracy_check_as_eager_non_deterministic(self):
+        if self.args.accuracy and self.args.training:
+            return self._accuracy["skip"]["eager_not_deterministic"]
+        return set()
+
+    @property
+    def skip_multiprocess_models(self):
+        return self._skip["multiprocess"]
 
     @property
     def skip_models_due_to_control_flow(self):
         return self._skip["control_flow"]
 
-    def _get_model_cls_and_config(self, model_name):
-        model_cls = getattr(transformers, model_name)
-        config_cls = model_cls.config_class
-        config = config_cls()
-        return model_cls, config
-
-    @download_retry_decorator
-    def _download_model(self, model_name):
-        model_cls, config = self._get_model_cls_and_config(model_name)
-        model = model_cls.from_config(config)
-        return model
-
-    def load_model(self, device, model_name, batch_size=None, extra_args=None):
-        """
-        Load the model with the user-specified backend (ipex, zentorch, etc.).
-        """
-        is_training = self.args.training
-        use_eval_mode = self.args.use_eval_mode
-        dtype = torch.float32
-        reset_rng_state()
-
-        model_cls, config = self._get_model_cls_and_config(model_name)
-        model = self._download_model(model_name)
-        model = model.to(device, dtype=dtype)
-
-        if self.args.enable_activation_checkpointing:
-            model.gradient_checkpointing_enable()
-
-        batch_size = batch_size or 16  # Default batch size if not specified
-
-        example_inputs = {
-            "input_ids": torch.randint(
-                0, config.vocab_size, (batch_size, 128), device=device
-            )
+    @property
+    def guard_on_nn_module_models(self):
+        return {
+            "vision_maskrcnn",
         }
 
+    @property
+    def inline_inbuilt_nn_modules_models(self):
+        return {
+            "basic_gnn_edgecnn",
+            "drq",
+            "hf_Reformer",
+            "DALLE2_pytorch",
+            "hf_BigBird",
+            "detectron2_maskrcnn_r_50_fpn",
+            "detectron2_maskrcnn_r_101_fpn",
+            "vision_maskrcnn",
+            "doctr_reco_predictor",
+            "hf_T5_generate",
+        }
+
+    def load_model(
+        self,
+        device,
+        model_name,
+        batch_size=None,
+        part=None,
+        extra_args=None,
+    ):
+        if self.args.enable_activation_checkpointing:
+            raise NotImplementedError(
+                "Activation checkpointing not implemented for Torchbench models"
+            )
+        is_training = self.args.training
+        use_eval_mode = self.args.use_eval_mode
+        candidates = [
+            f"torchbenchmark.models.{model_name}",
+            f"torchbenchmark.canary_models.{model_name}",
+            f"torchbenchmark.models.fb.{model_name}",
+        ]
+        for c in candidates:
+            try:
+                module = importlib.import_module(c)
+                break
+            except ModuleNotFoundError as e:
+                if e.name != c:
+                    raise
+        else:
+            raise ImportError(f"could not import any of {candidates}")
+        benchmark_cls = getattr(module, "Model", None)
+        if benchmark_cls is None:
+            raise NotImplementedError(f"{model_name}.Model is None")
+        
+        
+
+        if not hasattr(benchmark_cls, "name"):
+            benchmark_cls.name = model_name
+
+        cant_change_batch_size = (
+            not getattr(benchmark_cls, "ALLOW_CUSTOMIZE_BSIZE", True)
+            or model_name in self._config["dont_change_batch_size"]
+        )
+        if cant_change_batch_size:
+            batch_size = None
         if (
-            is_training
-            and not use_eval_mode
-            and not (self.args.accuracy and model_name in self._config["only_inference"])
+            batch_size is None
+            and is_training
+            and model_name in self._batch_size["training"]
+        ):
+            batch_size = self._batch_size["training"][model_name]
+        elif (
+            batch_size is None
+            and not is_training
+            and model_name in self._batch_size["inference"]
+        ):
+            batch_size = self._batch_size["inference"][model_name]
+        
+        if model_name in BATCH_SIZE_KNOWN_MODELS:
+            batch_size_default = BATCH_SIZE_KNOWN_MODELS[model_name]
+        elif batch_size is None:
+            batch_size_default = 16
+
+        # Control the memory footprint for few models
+        if self.args.accuracy and model_name in self._accuracy["max_batch_size"]:
+            batch_size = min(batch_size, self._accuracy["max_batch_size"][model_name])
+
+        # workaround "RuntimeError: not allowed to set torch.backends.cudnn flags"
+        torch.backends.__allow_nonbracketed_mutation_flag = True
+        if extra_args is None:
+            extra_args = []
+        if part:
+            extra_args += ["--part", part]
+
+        # sam_fast only runs with amp
+        if model_name == "sam_fast":
+            self.args.amp = True
+            self.setup_amp()
+
+        if model_name == "vision_maskrcnn" and is_training:
+            # Output of vision_maskrcnn model is a list of bounding boxes,
+            # sorted on the basis of their scores. This makes accuracy
+            # comparison hard with torch.compile. torch.compile can cause minor
+            # divergences in the output because of how fusion works for amp in
+            # TorchInductor compared to eager.  Therefore, instead of looking at
+            # all the bounding boxes, we compare only top 4.
+            model_kwargs = {"box_detections_per_img": 4}
+            benchmark = benchmark_cls(
+                test="train",
+                device=device,
+                batch_size=batch_size,
+                extra_args=extra_args,
+                model_kwargs=model_kwargs,
+            )
+            use_eval_mode = True
+        elif is_training:
+            benchmark = benchmark_cls(
+                test="train",
+                device=device,
+                batch_size=batch_size,
+                extra_args=extra_args,
+            )
+        else:
+            benchmark = benchmark_cls(
+                test="eval",
+                device=device,
+                batch_size=batch_size,
+                extra_args=extra_args,
+            )
+        model, example_inputs = benchmark.get_module()
+        if model_name in [
+            "basic_gnn_edgecnn",
+            "basic_gnn_gcn",
+            "basic_gnn_sage",
+            "basic_gnn_gin",
+        ]:
+            _reassign_parameters(model)
+
+        # Models that must be in train mode while training
+        if is_training and (
+            not use_eval_mode or model_name in self._config["only_training"]
         ):
             model.train()
         else:
             model.eval()
+        gc.collect()
+        batch_size = benchmark.batch_size
+        if model_name == "torchrec_dlrm":
+            batch_namedtuple = namedtuple(
+                "Batch", "dense_features sparse_features labels"
+            )
+            example_inputs = tuple(
+                batch_namedtuple(
+                    dense_features=batch.dense_features,
+                    sparse_features=batch.sparse_features,
+                    labels=batch.labels,
+                )
+                for batch in example_inputs
+            )
+        # Torchbench has quite different setup for yolov3, so directly passing
+        # the right example_inputs
+        if model_name == "yolov3":
+            example_inputs = (torch.rand(batch_size, 3, 384, 512).to(device),)
+        # See https://github.com/pytorch/benchmark/issues/1561
+        if model_name == "maml_omniglot":
+            batch_size = 5
+            assert example_inputs[0].shape[0] == batch_size
+        if model_name == "vision_maskrcnn":
+            batch_size = 1
+        # global current_name, current_device
+        # current_device = device
+        # current_name = benchmark.name
 
-        # ✅ **Force Custom Backend Instead of Inductor**
-        if chosen_backend:
-            torch._dynamo.reset()
-            os.environ["TORCH_COMPILE_BACKEND"] = chosen_backend
-            model = torch.compile(model, backend=chosen_backend)
-            log.info(f"Using backend: {chosen_backend} for model: {model_name}")
-
+        if self.args.trace_on_xla:
+            # work around for: https://github.com/pytorch/xla/issues/4174
+            import torch_xla  # noqa: F401
         self.validate_model(model, example_inputs)
-        return device, model_name, model, example_inputs, batch_size
+        return device, benchmark.name, model, example_inputs, batch_size
+
+    def iter_model_names(self, args):
+        model_names = list(BATCH_SIZE_KNOWN_MODELS.keys())
+        model_names = sorted(set(model_names))
+
+        start, end = self.get_benchmark_indices(len(model_names))
+        for index, model_name in enumerate(model_names):
+            if index < start or index >= end:
+                continue
+            if (
+                not re.search("|".join(args.filter), model_name, re.IGNORECASE)
+                or re.search("|".join(args.exclude), model_name, re.IGNORECASE)
+                or model_name in args.exclude_exact
+                or model_name in self.skip_models
+            ):
+                continue
+            yield model_name
+
+    def pick_grad(self, name, is_training):
+        if is_training or name in ("maml",):
+            return torch.enable_grad()
+        else:
+            return torch.no_grad()
+
+    def use_larger_multiplier_for_smaller_tensor(self, name):
+        return name in self._require_larger_multiplier_for_smaller_tensor
+
+    def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
+        tolerance = 1e-4
+        cosine = self.args.cosine
+        # Increase the tolerance for torch allclose
+        if self.args.float16 or self.args.amp:
+            if name in self._tolerance["higher_fp16"]:
+                return 1e-2, cosine
+            elif name in self._tolerance["even_higher"]:
+                return 8 * 1e-2, cosine
+            return 1e-3, cosine
+
+        if self.args.bfloat16:
+            if name in self._tolerance["higher_bf16"]:
+                return 1e-2, cosine
+
+        if is_training and (current_device == "cuda" or current_device == "xpu"):
+            tolerance = 1e-3
+            if name in self._tolerance["cosine"]:
+                cosine = True
+            elif name in self._tolerance["higher"]:
+                tolerance = 1e-3
+            elif name in self._tolerance["even_higher"]:
+                tolerance = 8 * 1e-2
+        return tolerance, cosine
 
     def compute_loss(self, pred):
-        return pred[0]
+        return reduce_to_scalar_loss(pred)
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
         with self.autocast(**self.autocast_arg):
-            return mod(**inputs)
+            if isinstance(inputs, dict):
+                return mod(**inputs)
+            else:
+                return mod(*inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
         cloned_inputs = clone_inputs(inputs)
         self.optimizer_zero_grad(mod)
         with self.autocast(**self.autocast_arg):
-            pred = mod(**cloned_inputs)
+            if isinstance(cloned_inputs, dict):
+                pred = mod(**cloned_inputs)
+            else:
+                pred = mod(*cloned_inputs)
             loss = self.compute_loss(pred)
         self.grad_scaler.scale(loss).backward()
         self.optimizer_step()
@@ -182,23 +468,12 @@ class HuggingfaceRunner(BenchmarkRunner):
         return None
 
 
-def huggingface_main():
-    """
-    Main function to run HuggingFace benchmarks with a custom backend (ipex, zentorch).
-    """
+def torchbench_main():
+    original_dir = setup_torchbench_cwd()
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore")
-
-    # ✅ **Check if user-specified backend is set**
-    if "TORCH_COMPILE_BACKEND" in os.environ:
-        log.info(f"Running with backend: {os.environ['TORCH_COMPILE_BACKEND']}")
-    else:
-        log.warning("Backend not set. Running in eager mode.")
-
-    main(HuggingfaceRunner())
+    main(TorchBenchmarkRunner(), original_dir)
 
 
 if __name__ == "__main__":
-    huggingface_main()
-
-
+    torchbench_main()
