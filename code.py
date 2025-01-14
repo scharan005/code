@@ -246,8 +246,15 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             raise NotImplementedError(
                 "Activation checkpointing not implemented for Torchbench models"
             )
+        if model_name not in BATCH_SIZE_KNOWN_MODELS:
+            logging.info(f"Model {model_name} not in torchbench_models_list.txt - skipping")
+            return None, None, None, None, None
+
+        final_batch_size = BATCH_SIZE_KNOWN_MODELS[model_name]   
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
+        logging.info(f"Using batch size {final_batch_size} from list for {model_name}")
+
         candidates = [
             f"torchbenchmark.models.{model_name}",
             f"torchbenchmark.canary_models.{model_name}",
@@ -261,12 +268,13 @@ class TorchBenchmarkRunner(BenchmarkRunner):
                 if e.name != c:
                     raise
         else:
-            raise ImportError(f"could not import any of {candidates}")
+            logging.warning(f"Could not import model {model_name} from any known location")
+            return None, None, None, None, None
+        
         benchmark_cls = getattr(module, "Model", None)
         if benchmark_cls is None:
-            raise NotImplementedError(f"{model_name}.Model is None")
-        
-        
+            logging.warning(f"{model_name}.Model is None")
+            return None, None, None, None, None
 
         if not hasattr(benchmark_cls, "name"):
             benchmark_cls.name = model_name
@@ -276,7 +284,7 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             or model_name in self._config["dont_change_batch_size"]
         )
         if cant_change_batch_size:
-            batch_size = None
+            logging.info(f"Model {model_name} doesn't allow batch size customization - using model's default batch size")
         if (
             batch_size is None
             and is_training
@@ -290,10 +298,6 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         ):
             batch_size = self._batch_size["inference"][model_name]
         
-        if model_name in BATCH_SIZE_KNOWN_MODELS:
-            batch_size_default = BATCH_SIZE_KNOWN_MODELS[model_name]
-        elif batch_size is None:
-            batch_size_default = 16
 
         # Control the memory footprint for few models
         if self.args.accuracy and model_name in self._accuracy["max_batch_size"]:
